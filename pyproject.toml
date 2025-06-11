@@ -5,10 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "dotenv>=0.9.9",
+    "python-dotenv>=1.1.0", # Corrected package name
     "flask>=3.1.0",
     "flask-sqlalchemy>=3.1.1",
     "gunicorn>=23.0.0",
+    "gevent>=25.5.1", # Added gevent
     "pdf2image>=1.17.0",
     "psycopg2-binary>=2.9.10",
     "requests>=2.32.3",
