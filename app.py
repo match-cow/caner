@@ -26,6 +26,7 @@ import traceback
 # import threading # Removed, scheduler moved out
 import sys
 import re # Added import for regular expressions
+import atexit # Added for APScheduler shutdown
 from datetime import datetime, date # Removed timedelta import
 from sqlalchemy import text # Import text for raw SQL expressions
 
@@ -39,6 +40,7 @@ from flask import (
     send_from_directory,
 )
 from werkzeug.middleware.proxy_fix import ProxyFix
+from apscheduler.schedulers.background import BackgroundScheduler # Added for scheduled tasks
 # from pdf2image import convert_from_path # Removed, no longer needed
 # from selenium import webdriver # Removed, no longer needed
 # from selenium.webdriver.firefox.options import Options # Removed, no longer needed
@@ -49,7 +51,11 @@ from dotenv import load_dotenv
 from utils.xml_parser import parse_mensa_data, get_available_mensen, get_available_dates
 from models import db, Meal, XXXLutzChangingMeal, XXXLutzFixedMeal, MealVote, PageView
 from data_loader import load_xml_data_to_db, load_xxxlutz_meals
-# NOTE: We don't import from data_fetcher here as it's meant to be run separately (e.g., via cron)
+# Imports from data_fetcher for scheduled tasks
+from data_fetcher import refresh_xxxlutz_vouchers as df_refresh_xxxlutz_vouchers
+from data_fetcher import refresh_menu_hg_and_process as df_refresh_menu_hg_and_process
+# NOTE: The user's request to run data_fetcher tasks from within app.py using a scheduler
+# means we now import specific functions directly for this purpose.
 
 # Increase recursion limit (Keep this relatively high up)
 sys.setrecursionlimit(5000)  # Increased from default 1000
@@ -254,6 +260,77 @@ with app.app_context(): # Needed for db.create_all() and initial loads
     # Perform initial loads needed *by the app* itself
     # Voucher/Menu data is assumed to be populated by the external data_fetcher script (e.g., via cron)
     perform_initial_app_loads() # This now only loads Mensa XML
+
+# --- START: APScheduler job definition for data_fetcher tasks ---
+def scheduled_data_fetch_job():
+    logger.info("APScheduler: Starting scheduled data fetch job (from data_fetcher components)...")
+    # Ensure this runs within the Flask app context if DB operations are involved
+    # The 'app' variable is the Flask app instance from this file (app.py)
+    # The 'logger' is the logger configured in this file (app.py)
+    # XML_SOURCE_URL is a constant defined in this file (app.py)
+    # load_xml_data_to_db is imported from data_loader.py in this file (app.py)
+    # df_refresh_xxxlutz_vouchers and df_refresh_menu_hg_and_process are imported from data_fetcher.py
+    with app.app_context():
+        xml_success = False
+        voucher_success = False
+        menu_success = False
+
+        # 1. Mensa XML Data Refresh (using data_loader.load_xml_data_to_db)
+        logger.info("APScheduler: --- Starting Mensa XML Data Refresh ---")
+        try:
+            xml_success = load_xml_data_to_db(XML_SOURCE_URL)
+            if xml_success:
+                logger.info("APScheduler: --- Mensa XML Data Refresh Completed Successfully ---")
+            else:
+                logger.error("APScheduler: --- Mensa XML Data Refresh Failed ---")
+        except Exception as e:
+            logger.error(f"APScheduler: Critical error during Mensa XML data refresh: {e}")
+            logger.error(traceback.format_exc()) # Log full traceback
+            xml_success = False
+
+        # 2. XXXLutz Voucher Refresh (using data_fetcher.refresh_xxxlutz_vouchers)
+        logger.info("APScheduler: --- Starting XXXLutz Voucher Refresh ---")
+        try:
+            voucher_success = df_refresh_xxxlutz_vouchers()
+            # This function logs its own success/failure details via data_fetcher's logger
+        except Exception as e:
+            logger.error(f"APScheduler: Critical error during XXXLutz Voucher Refresh: {e}")
+            logger.error(traceback.format_exc()) # Log full traceback
+            voucher_success = False
+
+        # 3. Menu HG Refresh and Processing (using data_fetcher.refresh_menu_hg_and_process)
+        logger.info("APScheduler: --- Starting Menu HG Refresh and Processing ---")
+        try:
+            menu_success = df_refresh_menu_hg_and_process()
+            # This function logs its own success/failure details via data_fetcher's logger
+        except Exception as e:
+            logger.error(f"APScheduler: Critical error during Menu HG Refresh and Processing: {e}")
+            logger.error(traceback.format_exc()) # Log full traceback
+            menu_success = False
+
+        logger.info(f"APScheduler: Scheduled data fetch job finished. XML: {xml_success}, Voucher: {voucher_success}, Menu: {menu_success}")
+# --- END: APScheduler job definition ---
+
+# --- START: APScheduler setup and start ---
+# Initialize the scheduler
+# daemon=True allows the main program to exit even if scheduled jobs are pending
+# timezone is set to ensure jobs run according to local time in Berlin
+scheduler = BackgroundScheduler(daemon=True, timezone="Europe/Berlin")
+
+# Schedule the job function to run at 6:00, 8:00, 10:00, and 12:00 (noon)
+# The times are interpreted according to the 'Europe/Berlin' timezone
+scheduler.add_job(scheduled_data_fetch_job, 'cron', hour='6,8,10,12', minute='0')
+
+try:
+    scheduler.start()
+    logger.info("APScheduler started for data_fetcher tasks. Scheduled for 6, 8, 10, 12 o'clock (Europe/Berlin).")
+    # Register a function to shut down the scheduler when the application exits
+    atexit.register(lambda: scheduler.shutdown())
+    logger.info("APScheduler shutdown hook registered.")
+except Exception as e:
+    logger.error(f"Failed to start APScheduler: {e}")
+    logger.error(traceback.format_exc()) # Log full traceback
+# --- END: APScheduler setup and start ---
 
 
 @app.route("/")
